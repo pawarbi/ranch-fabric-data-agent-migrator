@@ -1,5 +1,7 @@
 # RANCH (BETA)
 
+[![Tests](https://github.com/pawarbi/ranch-fabric-data-agent-migrator/actions/workflows/tests.yml/badge.svg)](https://github.com/pawarbi/ranch-fabric-data-agent-migrator/actions/workflows/tests.yml)
+
 **R**esponses **A**PI **N**otebook **C**onversion **H**elper for Microsoft
 Fabric Data Agents.
 
