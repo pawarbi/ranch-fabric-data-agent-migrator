@@ -9,10 +9,26 @@ SDK_MAPPING = {
         "fixed normalization of non-streamed Responses results."
     ),
     "release_evidence": {
-        "0.1.23a0": "PyPI changelog announced the opt-in client.",
-        "0.1.27a0": "Downloaded wheel contains Responses create/stream support.",
-        "0.1.28a0": "Downloaded wheel adds retrieve normalization; changelog records the non-streamed result fix.",
-        "0.1.29a0": "PyPI release metadata observed on 2026-08-13; changelog records an aiohttp dependency change.",
+        "0.1.23a0": (
+            "The version-specific PyPI changelog records duplicate-fewshot and "
+            "evaluation model/prompt fixes; it does not announce Responses support."
+        ),
+        "0.1.26a0": (
+            "The version-specific PyPI changelog introduces public management-plane "
+            "APIs through FabricDataAgentManagement."
+        ),
+        "0.1.27a0": (
+            "PyPI documents FabricOpenAIResponses, responses.create/stream, "
+            "previous_response_id, and class-based evaluation selection."
+        ),
+        "0.1.28a0": (
+            "PyPI documents normalized Response objects from non-streamed "
+            "responses.create and responses.retrieve calls."
+        ),
+        "0.1.29a0": (
+            "PyPI retains the 0.1.28a0 Responses contract and records only an "
+            "aiohttp dependency change for this release."
+        ),
     },
     "rules": [
         {
