@@ -1,0 +1,2 @@
+nbformat>=5.9,<6
+streamlit>=1.37,<2

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fabric-data-agent-responses-migrator"
+version = "0.1.0"
+description = "Conservative notebook migration assistant for the Fabric Data Agent Responses API"
+requires-python = ">=3.10"
+dependencies = [
+  "nbformat>=5.9,<6",
+  "streamlit>=1.37,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
