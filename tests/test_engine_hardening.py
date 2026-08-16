@@ -1182,6 +1182,165 @@ def test_a_call_that_already_passes_client_class_is_not_touched_again() -> None:
     assert code_text(result.notebook_bytes).count("import FabricOpenAIResponses") == 1
 
 
+@pytest.mark.parametrize(
+    "reference",
+    [
+        pytest.param(
+            "help(fabric_client.beta.threads.runs.create)", id="help-on-method"
+        ),
+        pytest.param(
+            "submit = fabric_client.beta.threads.runs.create", id="assigned-to-name"
+        ),
+        pytest.param("print(fabric_client.beta.threads)", id="namespace-printed"),
+        pytest.param(
+            "register(fabric_client.beta.threads.messages.create)",
+            id="passed-as-callback",
+        ),
+    ],
+)
+def test_referencing_the_old_api_without_calling_it_blocks(reference: str) -> None:
+    """These are not calls, so the call-shaped rules never saw them.
+
+    The notebook was reported as migrated while still holding a reference that
+    breaks when the Assistants API is retired.
+    """
+    data = notebook_bytes(SETUP, 'question = "Revenue?"', QUESTION, reference)
+
+    result = MigrationEngine().migrate(data, "bare-reference.ipynb")
+
+    assert result.report.status == "partial_migration"
+    assert result.notebook_bytes == data
+    assert "UNSUPPORTED-ATTRIBUTE-001" in finding_ids(result)
+
+
+def test_a_normal_query_notebook_has_no_bare_reference_finding() -> None:
+    """The rule must not fire on the calls it is meant to ignore."""
+    data = notebook_bytes(SETUP, 'question = "Revenue?"', QUESTION, POLL, READ)
+
+    result = MigrationEngine().migrate(data, "normal.ipynb")
+
+    assert "UNSUPPORTED-ATTRIBUTE-001" not in finding_ids(result)
+    assert result.report.status == "migrated"
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        pytest.param("print(run.status)", id="run-status"),
+        pytest.param("saved = run.id", id="run-id"),
+        pytest.param("print(pd.DataFrame().beta)", id="unrelated-beta-attribute"),
+    ],
+)
+def test_attributes_that_are_not_the_assistants_namespace_are_ignored(
+    usage: str,
+) -> None:
+    data = notebook_bytes(SETUP, 'question = "Revenue?"', QUESTION, usage)
+
+    result = MigrationEngine().migrate(data, "unrelated.ipynb")
+
+    assert "UNSUPPORTED-ATTRIBUTE-001" not in finding_ids(result)
+
+
+COLLATERAL_CASES = [
+    pytest.param(
+        "audit_tag = 'KEEP_1'; thread = fabric_client.beta.threads.create()\n",
+        ["KEEP_1"],
+        id="semicolon-shares-line-with-setup",
+    ),
+    pytest.param(
+        QUESTION.rstrip("\n") + "; started = 'KEEP_2'\n",
+        ["KEEP_2"],
+        id="semicolon-after-run-create",
+    ),
+    pytest.param(
+        QUESTION.replace(")\n", ")  # KEEP_3\n", 1),
+        ["KEEP_3"],
+        id="trailing-comment-on-migrated-line",
+    ),
+    pytest.param(
+        "results = []\n"
+        "results.append(fabric_client.beta.threads.runs.create(\n"
+        "    thread_id=thread.id, assistant_id=assistant.id))\n"
+        "keep = 'KEEP_4'\n",
+        ["KEEP_4", "results.append"],
+        id="sdk-call-nested-in-another-call",
+    ),
+    pytest.param(
+        "try:\n"
+        "    run = fabric_client.beta.threads.runs.create(\n"
+        "        thread_id=thread.id, assistant_id=assistant.id)\n"
+        "except Exception:\n"
+        "    fallback = 'KEEP_5'\n",
+        ["KEEP_5", "except Exception:"],
+        id="sdk-call-inside-try-except",
+    ),
+    pytest.param(
+        "runs = [fabric_client.beta.threads.runs.create(\n"
+        "    thread_id=thread.id, assistant_id=assistant.id) for _ in range(2)]\n"
+        "keep = 'KEEP_6'\n",
+        ["KEEP_6", "for _ in range(2)"],
+        id="sdk-call-in-a-comprehension",
+    ),
+    pytest.param(
+        "import time\n"
+        "attempts = 0\n"
+        "while run.status == 'queued' or run.status == 'in_progress':\n"
+        "    attempts += 1  # KEEP_7\n"
+        "    run = fabric_client.beta.threads.runs.retrieve(\n"
+        "        thread_id=thread.id, run_id=run.id)\n"
+        "    time.sleep(1)\n",
+        ["KEEP_7", "attempts += 1"],
+        id="polling-loop-with-extra-body",
+    ),
+    pytest.param(
+        "try:\n"
+        "    keep = 'KEEP_8'\n"
+        "finally:\n"
+        "    fabric_client.beta.threads.delete(thread.id)\n",
+        ["KEEP_8", "finally:"],
+        id="cleanup-inside-finally",
+    ),
+    pytest.param(
+        "messages = fabric_client.beta.threads.messages.list(\n"
+        "    thread_id=thread.id, order='asc')\n"
+        "seen = 0  # KEEP_9\n"
+        "for message in messages:\n"
+        '    print(f"{message.role}: {message.content[0].text.value}")\n',
+        ["KEEP_9", "seen = 0"],
+        id="extraction-loop-with-extra-work",
+    ),
+    pytest.param(
+        "if use_agent:\n"
+        "    fabric_client = FabricOpenAI(artifact_name='A')\n"
+        "else:\n"
+        "    fabric_client = None  # KEEP_10\n",
+        ["KEEP_10", "else:"],
+        id="conditional-client-construction",
+    ),
+]
+
+
+@pytest.mark.parametrize(("source", "sentinels"), COLLATERAL_CASES)
+def test_migration_never_disturbs_neighbouring_code(
+    source: str, sentinels: list[str]
+) -> None:
+    """Code that is not part of the migration must survive verbatim.
+
+    Each case puts unrelated code somewhere awkward: sharing a line via a
+    semicolon, in a trailing comment, or wrapping the SDK call. Refusing to
+    migrate is an acceptable outcome. Losing the neighbouring code is not.
+    """
+    data = notebook_bytes(SETUP, "q = 'Revenue?'\nuse_agent = True", source)
+
+    result = MigrationEngine().migrate(data, "collateral.ipynb")
+    migrated = code_text(result.notebook_bytes)
+
+    for sentinel in sentinels:
+        assert sentinel in migrated, sentinel
+    if result.report.summary["cells_changed"] == 0:
+        assert result.notebook_bytes == data
+
+
 def test_report_never_carries_a_detected_secret_value() -> None:
     secret = "sk-live-must-never-be-reported"
     data = notebook_bytes(

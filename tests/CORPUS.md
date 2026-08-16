@@ -80,6 +80,29 @@ The commented-out and regex-literal cases are worth keeping in mind. Both would
 be false positives for anything that pattern-matches on raw cell text, and both
 are the reason the blockers run over the parsed tree instead.
 
+## Hand-written pass
+
+Public notebooks skew toward evaluation-only usage, so a second corpus of five
+notebooks was written by hand to cover shapes the public sample does not: a
+pandas and matplotlib review with a single agent question, a multi-turn thread,
+an evaluation-only run, a nightly job doing both a query and an evaluation
+behind an aliased import, and a scratchpad with shell installs and a `%%time`
+cell. Roughly two thirds of each notebook is ordinary analysis code.
+
+Old-API text was deliberately placed where it must never be rewritten:
+markdown prose and fenced blocks, `#` comments, a function docstring, stdout
+streams, an `execute_result` repr, and an error traceback. All of it survived
+byte for byte, along with outputs, execution counts and metadata.
+
+That pass found one real defect. `help(client.beta.threads.runs.create)` was
+neither migrated nor flagged, and the notebook was reported as migrated while
+still holding a reference that breaks at retirement. The engine only inspected
+`.beta.` paths in call position, so a bare attribute reference was invisible.
+`UNSUPPORTED-ATTRIBUTE-001` now blocks it.
+
+The findings live in `test_engine_hardening.py` rather than as committed
+notebooks, since `.gitignore` excludes `*.ipynb`.
+
 ## Gap this sweep exposed
 
 The sample contains exactly one notebook exercising the complete Assistants

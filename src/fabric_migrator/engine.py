@@ -500,6 +500,58 @@ class MigrationEngine:
                 )
         return blockers
 
+    def _find_bare_beta_references(
+        self, cells: list[ParsedCell], findings: list[Finding]
+    ) -> list[str]:
+        """Flag Assistants attributes that are referenced but never called.
+
+        `help(client.beta.threads.runs.create)` or
+        `submit = client.beta.threads.runs.create` breaks once the Assistants
+        API is gone, but neither is a call, so the call-shaped rules never see
+        it. Left alone it would be reported as a fully migrated notebook.
+        """
+        blockers: list[str] = []
+        for cell in cells:
+            if cell.tree is None:
+                continue
+            nested: set[int] = set()
+            called: set[int] = set()
+            for node in ast.walk(cell.tree):
+                if isinstance(node, ast.Attribute) and isinstance(
+                    node.value, ast.Attribute
+                ):
+                    nested.add(id(node.value))
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                    called.add(id(node.func))
+            for node in ast.walk(cell.tree):
+                if not isinstance(node, ast.Attribute):
+                    continue
+                if id(node) in nested or id(node) in called:
+                    continue
+                path = _dotted_name(node)
+                if not path or (".beta." not in path and not path.endswith(".beta")):
+                    continue
+                blockers.append(path)
+                findings.append(
+                    Finding(
+                        "UNSUPPORTED-ATTRIBUTE-001",
+                        "Assistants API referenced without calling it",
+                        cell.index,
+                        "manual",
+                        False,
+                        (
+                            f"{path} is referenced but never called here, so the "
+                            "tool cannot tell what it is used for. It stops "
+                            "working when the Assistants API is retired."
+                        ),
+                        "Replace this reference with its Responses equivalent by hand.",
+                        line_start=node.lineno,
+                        line_end=node.end_lineno,
+                        original_excerpt=_redact(cell.text(node)),
+                    )
+                )
+        return blockers
+
     def _evaluation_module_aliases(self, cells: list[ParsedCell]) -> set[str]:
         """Names that refer to the fabric evaluation module in this notebook.
 
@@ -854,6 +906,7 @@ class MigrationEngine:
                         ),
                     )
                 )
+        blockers.extend(self._find_bare_beta_references(cells, findings))
         wrapper_cells: set[int] = set()
         for cell, statement, call, path in calls:
             if ".beta." in path and not any(path.endswith(suffix) for suffix in OLD_SUFFIXES):
