@@ -31,12 +31,64 @@ SECRET_PATTERN = re.compile(
     r"(?i)(api[_-]?key|access[_-]?token|client[_-]?secret|password)"
     r"\s*[:=]\s*([\"'])(.*?)\2"
 )
+MCP_DOCS_URL = (
+    "https://learn.microsoft.com/fabric/data-science/data-agent-mcp-server"
+)
+# Rule families that count toward the score. A blocker outside this list would
+# be reported but leave the score at 100, which would read as "fully migrated"
+# on a notebook that was not touched at all.
+SCORED_RULE_PREFIXES = (
+    "QUERY-",
+    "EVAL-",
+    "UNSUPPORTED-",
+    "OUTPUT-",
+    "EXTERNAL-",
+)
+FABRIC_ENDPOINT_PATTERN = re.compile(
+    r"(?i)(aiassistant/openai|/aiskills/|/dataagents/"
+    r"|api\.fabric\.microsoft\.com)"
+)
+# Keys Fabric writes into notebook metadata on export. Their presence confirms
+# a Fabric notebook; their absence proves nothing, because the published
+# Microsoft samples are cleaned down to a bare kernelspec before publishing.
+FABRIC_METADATA_MARKERS = (
+    "a365ComputeOptions",
+    "spark_compute",
+    "synapse_widget",
+    "sessionKeepAliveTimeout",
+    "trident",
+    "kernel_info",
+    "microsoft",
+)
+FABRIC_KERNEL_NAMES = {"synapse_pyspark"}
+DYNAMIC_NAMES = {"getattr", "setattr", "exec", "eval"}
 DYNAMIC_PATTERN = re.compile(r"\b(getattr|setattr|exec|eval)\s*\(")
+ASYNC_PATTERN = re.compile(r"\b(async\s+def|await|async\s+for|async\s+with)\b")
+# Python ends a line at \n, \r\n, or \r only. str.splitlines also breaks on
+# \v, \f, \x85,   and friends, which would shift every span after a cell
+# that contains one of those characters inside a string literal.
+LINE_BREAK_PATTERN = re.compile(r"\r\n|\r|\n")
 PERSISTED_THREAD_PATTERN = re.compile(
     r"(?is)(?:thread[_-]?id.{0,160}(?:json\.dump|json\.dumps|"
     r"pickle\.dump|pickle\.dumps|open\s*\(|write_text\s*\(|os\.environ)|"
     r"(?:json\.dump|json\.dumps|pickle\.dump|pickle\.dumps|open\s*\(|"
     r"write_text\s*\(|os\.environ).{0,160}thread[_-]?id)"
+)
+SDK_REQUIREMENT_PATTERN = re.compile(
+    r"(?<!\S)(?P<quote>[\"']?)"
+    r"fabric-data-agent-sdk"
+    r"(?P<specifiers>(?:(?:==|>=|<=|<|>)[0-9A-Za-z][0-9A-Za-z._-]*)"
+    r"(?:,(?:==|>=|<=|<|>)[0-9A-Za-z][0-9A-Za-z._-]*)*)?"
+    r"(?P=quote)(?=\s|$)",
+    re.IGNORECASE,
+)
+SDK_SPECIFIER_PATTERN = re.compile(
+    r"(?P<operator>==|>=|<=|<|>)(?P<version>[0-9A-Za-z][0-9A-Za-z._-]*)"
+)
+SDK_VERSION_PATTERN = re.compile(
+    r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
+    r"(?:(?P<stage>a|b|rc)(?P<stage_number>\d+))?$",
+    re.IGNORECASE,
 )
 
 
@@ -94,12 +146,16 @@ def _char_col(line: str, byte_col: int) -> int:
 
 
 def _line_offsets(source: str) -> tuple[list[str], list[int]]:
-    lines = source.splitlines(keepends=True) or [""]
+    lines: list[str] = []
     offsets: list[int] = []
     cursor = 0
-    for line in lines:
+    for match in LINE_BREAK_PATTERN.finditer(source):
+        lines.append(source[cursor : match.end()])
         offsets.append(cursor)
-        cursor += len(line)
+        cursor = match.end()
+    if cursor < len(source) or not lines:
+        lines.append(source[cursor:])
+        offsets.append(cursor)
     return lines, offsets
 
 
@@ -163,6 +219,60 @@ def _comment_for(source: str, message: str) -> str:
     return f"{indent}# Migrated: {message}"
 
 
+def _sdk_version_key(version: str) -> tuple[int, int, int, int, int] | None:
+    match = SDK_VERSION_PATTERN.fullmatch(version)
+    if not match:
+        return None
+    stage_rank = {None: 3, "a": 0, "b": 1, "rc": 2}
+    stage = match.group("stage")
+    return (
+        int(match.group("major")),
+        int(match.group("minor")),
+        int(match.group("patch")),
+        stage_rank[stage.lower() if stage else None],
+        int(match.group("stage_number") or 0),
+    )
+
+
+def _sdk_requirement_replacement(match: re.Match[str]) -> str | None:
+    floor = SDK_MAPPING["minimum_recommended_release"]
+    floor_key = _sdk_version_key(floor)
+    specifiers = match.group("specifiers") or ""
+    quote = match.group("quote") or '"'
+    if floor_key is None:
+        return None
+    if not specifiers:
+        return f"{quote}fabric-data-agent-sdk>={floor}{quote}"
+
+    clauses = list(SDK_SPECIFIER_PATTERN.finditer(specifiers))
+    if not clauses or "".join(clause.group(0) for clause in clauses) != specifiers.replace(
+        ",", ""
+    ):
+        return None
+
+    if len(clauses) == 1 and clauses[0].group("operator") == "==":
+        version_key = _sdk_version_key(clauses[0].group("version"))
+        if version_key is None or version_key >= floor_key:
+            return None
+        return f"{quote}fabric-data-agent-sdk>={floor}{quote}"
+
+    lower_bound = next(
+        (clause for clause in clauses if clause.group("operator") == ">="),
+        None,
+    )
+    if lower_bound is None:
+        return None
+    lower_key = _sdk_version_key(lower_bound.group("version"))
+    if lower_key is None or lower_key >= floor_key:
+        return None
+
+    rewritten = [
+        f">={floor}" if clause is lower_bound else clause.group(0)
+        for clause in clauses
+    ]
+    return f"{quote}fabric-data-agent-sdk{','.join(rewritten)}{quote}"
+
+
 class MigrationEngine:
     def __init__(self, limits: NotebookLimits | None = None) -> None:
         self.limits = limits or NotebookLimits()
@@ -180,6 +290,7 @@ class MigrationEngine:
         }
         blockers = self._find_blockers(parsed, relevant_cells, findings)
         self._find_runtime_diagnostics(notebook, parsed, findings)
+        self._find_evaluation_runtime_scope(notebook, parsed, findings)
         inventory = self._inventory(parsed)
         blockers.extend(self._validate_inventory(inventory, parsed, findings))
 
@@ -204,7 +315,18 @@ class MigrationEngine:
                 )
             )
 
-        evaluation_changes = self._apply_evaluation_rule(parsed, findings)
+        # An unaliased client import that the query rule just renamed already
+        # provides FabricOpenAIResponses, so evaluation must not import it a
+        # second time. An aliased import does not bind the name, so it still
+        # needs its own import.
+        renamed_imports: list[tuple[int, int, int]] = []
+        if query_changes:
+            for import_cell, alias in inventory["old_import_locals"].values():
+                if alias.asname is None:
+                    renamed_imports.append((import_cell.index, alias.lineno, -1))
+        evaluation_changes = self._apply_evaluation_rule(
+            parsed, findings, renamed_imports
+        )
         sdk_changes = (
             self._upgrade_install_cell(parsed, findings)
             if query_changes or evaluation_changes
@@ -319,7 +441,7 @@ class MigrationEngine:
                         "Move magics to a separate cell or fix the syntax, then retry.",
                     )
                 )
-            if DYNAMIC_PATTERN.search(cell.source):
+            if self._has_dynamic_access(cell):
                 blockers.append(f"cell-{cell.index}-dynamic")
                 findings.append(
                     Finding(
@@ -332,7 +454,7 @@ class MigrationEngine:
                         "Migrate the dynamic call manually.",
                     )
                 )
-            if re.search(r"\b(async\s+def|await|async\s+for)\b", cell.source):
+            if self._has_async_orchestration(cell):
                 blockers.append(f"cell-{cell.index}-async")
                 findings.append(
                     Finding(
@@ -345,7 +467,7 @@ class MigrationEngine:
                         "Map this flow to Responses async/streaming behavior manually.",
                     )
                 )
-            if PERSISTED_THREAD_PATTERN.search(cell.source):
+            if self._has_persisted_thread_state(cell):
                 blockers.append(f"cell-{cell.index}-persisted-thread")
                 findings.append(
                     Finding(
@@ -359,6 +481,11 @@ class MigrationEngine:
                     )
                 )
             for match in SECRET_PATTERN.finditer(cell.source):
+                value = match.group(3).strip()
+                # api_key="" is how the Fabric samples build a client, and a
+                # <placeholder> is already a prompt to fill something in.
+                if not value or (value.startswith("<") and value.endswith(">")):
+                    continue
                 findings.append(
                     Finding(
                         "WARNING-SECRET-001",
@@ -373,6 +500,224 @@ class MigrationEngine:
                 )
         return blockers
 
+    def _find_bare_beta_references(
+        self, cells: list[ParsedCell], findings: list[Finding]
+    ) -> list[str]:
+        """Flag Assistants attributes that are referenced but never called.
+
+        `help(client.beta.threads.runs.create)` or
+        `submit = client.beta.threads.runs.create` breaks once the Assistants
+        API is gone, but neither is a call, so the call-shaped rules never see
+        it. Left alone it would be reported as a fully migrated notebook.
+        """
+        blockers: list[str] = []
+        for cell in cells:
+            if cell.tree is None:
+                continue
+            nested: set[int] = set()
+            called: set[int] = set()
+            for node in ast.walk(cell.tree):
+                if isinstance(node, ast.Attribute) and isinstance(
+                    node.value, ast.Attribute
+                ):
+                    nested.add(id(node.value))
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                    called.add(id(node.func))
+            for node in ast.walk(cell.tree):
+                if not isinstance(node, ast.Attribute):
+                    continue
+                if id(node) in nested or id(node) in called:
+                    continue
+                path = _dotted_name(node)
+                if not path or (".beta." not in path and not path.endswith(".beta")):
+                    continue
+                blockers.append(path)
+                findings.append(
+                    Finding(
+                        "UNSUPPORTED-ATTRIBUTE-001",
+                        "Assistants API referenced without calling it",
+                        cell.index,
+                        "manual",
+                        False,
+                        (
+                            f"{path} is referenced but never called here, so the "
+                            "tool cannot tell what it is used for. It stops "
+                            "working when the Assistants API is retired."
+                        ),
+                        "Replace this reference with its Responses equivalent by hand.",
+                        line_start=node.lineno,
+                        line_end=node.end_lineno,
+                        original_excerpt=_redact(cell.text(node)),
+                    )
+                )
+        return blockers
+
+    def _evaluation_module_aliases(self, cells: list[ParsedCell]) -> set[str]:
+        """Names that refer to the fabric evaluation module in this notebook.
+
+        Covers `import fabric.dataagent.evaluation`, an `as` alias for it, and
+        `from fabric.dataagent import evaluation`, so a qualified call is not
+        mistaken for unrelated code.
+        """
+        aliases = {"fabric.dataagent.evaluation"}
+        for cell in cells:
+            if cell.tree is None:
+                continue
+            for node in ast.walk(cell.tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.name == "fabric.dataagent.evaluation":
+                            aliases.add(alias.asname or alias.name)
+                elif (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module == "fabric.dataagent"
+                ):
+                    for alias in node.names:
+                        if alias.name == "evaluation":
+                            aliases.add(alias.asname or "evaluation")
+        return aliases
+
+    def _is_evaluation_call(self, node: ast.AST, aliases: set[str]) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        path = _dotted_name(node.func)
+        if path == "evaluate_data_agent":
+            return True
+        return bool(
+            path
+            and path.endswith(".evaluate_data_agent")
+            and path.rsplit(".", 1)[0] in aliases
+        )
+
+    def _fabric_notebook_evidence(self, notebook: NotebookNode) -> str | None:
+        """Name the metadata that confirms this notebook came out of Fabric."""
+        metadata = notebook.get("metadata", {}) or {}
+        for marker in FABRIC_METADATA_MARKERS:
+            if marker in metadata:
+                return f"metadata.{marker}"
+        kernel = (metadata.get("kernelspec") or {}).get("name")
+        if kernel in FABRIC_KERNEL_NAMES:
+            return f"kernelspec.name={kernel}"
+        return None
+
+    def _find_evaluation_runtime_scope(
+        self,
+        notebook: NotebookNode,
+        cells: list[ParsedCell],
+        findings: list[Finding],
+    ) -> None:
+        """Warn when evaluation code has no confirmed Fabric runtime.
+
+        evaluate_data_agent and its result display need the Fabric notebook
+        runtime. If the upload does not carry Fabric metadata we cannot tell
+        whether it runs there, so this says exactly that rather than claiming
+        the notebook is external.
+        """
+        aliases = self._evaluation_module_aliases(cells)
+        uses_evaluation = False
+        for cell in cells:
+            if cell.tree is None:
+                if re.search(
+                    r"(?m)^\s*from\s+fabric\.dataagent\.evaluation\s+import\b",
+                    cell.source,
+                ):
+                    uses_evaluation = True
+                continue
+            for node in ast.walk(cell.tree):
+                if self._is_evaluation_call(node, aliases) or (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module == "fabric.dataagent.evaluation"
+                ):
+                    uses_evaluation = True
+                    break
+            if uses_evaluation:
+                break
+        if not uses_evaluation or self._fabric_notebook_evidence(notebook):
+            return
+        findings.append(
+            Finding(
+                "RUNTIME-EVAL-SCOPE-001",
+                "Confirm this evaluation runs in a Fabric notebook",
+                0,
+                "medium",
+                False,
+                (
+                    "This notebook calls evaluate_data_agent but carries no "
+                    "Fabric authoring metadata, so the tool cannot confirm where "
+                    "it runs. Evaluation and its result display depend on the "
+                    "Fabric notebook runtime and fail outside it. Published "
+                    "Microsoft samples also lack this metadata, so this is a "
+                    "prompt to check rather than a verdict."
+                ),
+                (
+                    "If this runs in a Fabric notebook, no change is needed. If "
+                    "it runs from a local IDE, a script, or CI, query the data "
+                    f"agent through the MCP server instead: {MCP_DOCS_URL}"
+                ),
+            )
+        )
+
+    def _external_endpoint_evidence(self, cells: list[ParsedCell]) -> str | None:
+        """Describe why this looks like a call from outside Fabric, if it does.
+
+        A notebook that builds its own openai client, or that names a Fabric
+        data agent URL, is not using the Fabric SDK and cannot be moved onto
+        the Responses API by renaming an import.
+        """
+        endpoint_cell: int | None = None
+        openai_cell: int | None = None
+        for cell in cells:
+            if endpoint_cell is None and FABRIC_ENDPOINT_PATTERN.search(cell.source):
+                endpoint_cell = cell.index
+            if openai_cell is not None or cell.tree is None:
+                continue
+            for node in ast.walk(cell.tree):
+                if isinstance(node, ast.ImportFrom) and (node.module or "").split(
+                    "."
+                )[0] == "openai":
+                    openai_cell = cell.index
+                    break
+                if isinstance(node, ast.Import) and any(
+                    alias.name.split(".")[0] == "openai" for alias in node.names
+                ):
+                    openai_cell = cell.index
+                    break
+        if endpoint_cell is not None:
+            return "A Fabric data agent endpoint URL appears in this notebook."
+        if openai_cell is not None:
+            return "The client is built from the openai package."
+        return None
+
+    def _has_dynamic_access(self, cell: ParsedCell) -> bool:
+        if cell.tree is None:
+            return bool(DYNAMIC_PATTERN.search(cell.source))
+        for node in ast.walk(cell.tree):
+            if not isinstance(node, ast.Call):
+                continue
+            path = _dotted_name(node.func)
+            if path and path.rsplit(".", 1)[-1] in DYNAMIC_NAMES:
+                return True
+        return False
+
+    def _has_async_orchestration(self, cell: ParsedCell) -> bool:
+        if cell.tree is None:
+            return bool(ASYNC_PATTERN.search(cell.source))
+        return any(
+            isinstance(
+                node,
+                (ast.AsyncFunctionDef, ast.Await, ast.AsyncFor, ast.AsyncWith),
+            )
+            for node in ast.walk(cell.tree)
+        )
+
+    def _has_persisted_thread_state(self, cell: ParsedCell) -> bool:
+        if cell.tree is None:
+            return bool(PERSISTED_THREAD_PATTERN.search(cell.source))
+        return any(
+            PERSISTED_THREAD_PATTERN.search(cell.text(statement))
+            for statement in cell.tree.body
+        )
+
     def _find_runtime_diagnostics(
         self,
         notebook: NotebookNode,
@@ -383,7 +728,7 @@ class MigrationEngine:
             cell.index
             for cell in cells
             if re.search(
-                r"(?im)^\s*%pip\s+install\b[^\n]*fabric-data-agent-sdk\b",
+                r"(?im)^\s*[%!]pip\s+install\b[^\n]*fabric-data-agent-sdk\b",
                 cell.source,
             )
         ]
@@ -520,24 +865,48 @@ class MigrationEngine:
         assert isinstance(old_import_locals, dict)
         if any(".beta." in path for _, _, _, path in calls) and not old_import_locals:
             blockers.append("unresolved-client-import")
-            findings.append(
-                Finding(
-                    "UNSUPPORTED-CLIENT-001",
-                    "Fabric client import cannot be resolved",
-                    min(
-                        cell.index
-                        for cell, _, _, path in calls
-                        if ".beta." in path
-                    ),
-                    "manual",
-                    False,
-                    "The old query client is not imported with a supported direct import.",
-                    (
-                        "Use 'from fabric.dataagent.client import FabricOpenAI' "
-                        "or migrate the client manually."
-                    ),
-                )
+            first_cell = min(
+                cell.index for cell, _, _, path in calls if ".beta." in path
             )
+            external = self._external_endpoint_evidence(cells)
+            if external:
+                findings.append(
+                    Finding(
+                        "EXTERNAL-ENDPOINT-001",
+                        "Data agent is called from outside Fabric",
+                        first_cell,
+                        "manual",
+                        False,
+                        (
+                            f"{external} This code reaches the Assistants endpoint "
+                            "directly instead of going through the Fabric SDK, so "
+                            "the Responses API migration does not apply to it. That "
+                            "endpoint is also being retired."
+                        ),
+                        (
+                            "Rewrite this integration against the data agent MCP "
+                            "server, which is the supported way to query a data "
+                            "agent from outside a Fabric notebook: "
+                            f"{MCP_DOCS_URL}"
+                        ),
+                    )
+                )
+            else:
+                findings.append(
+                    Finding(
+                        "UNSUPPORTED-CLIENT-001",
+                        "Fabric client import cannot be resolved",
+                        first_cell,
+                        "manual",
+                        False,
+                        "The old query client is not imported with a supported direct import.",
+                        (
+                            "Use 'from fabric.dataagent.client import FabricOpenAI' "
+                            "or migrate the client manually."
+                        ),
+                    )
+                )
+        blockers.extend(self._find_bare_beta_references(cells, findings))
         wrapper_cells: set[int] = set()
         for cell, statement, call, path in calls:
             if ".beta." in path and not any(path.endswith(suffix) for suffix in OLD_SUFFIXES):
@@ -602,6 +971,35 @@ class MigrationEngine:
                         line_start=call.lineno,
                         line_end=call.end_lineno,
                         original_excerpt=_redact(cell.text(statement)),
+                    )
+                )
+        definitions = inventory["definitions"]
+        assert isinstance(definitions, set)
+        if not {"workspace_name", "workspace_id"} & definitions:
+            for cell, statement, call, path in calls:
+                if path not in old_import_locals:
+                    continue
+                if self._statement_indent(cell, statement) is not None:
+                    continue
+                blockers.append(f"placeholder-{cell.index}-{statement.lineno}")
+                findings.append(
+                    Finding(
+                        "UNSUPPORTED-CONFIG-001",
+                        "Workspace placeholder cannot be inserted safely",
+                        cell.index,
+                        "manual",
+                        False,
+                        (
+                            "The new client needs a workspace, but the client "
+                            "construction does not start its own line, so a "
+                            "placeholder assignment cannot be added above it."
+                        ),
+                        (
+                            "Move the client construction onto its own line, or "
+                            "define workspace_name yourself, then retry."
+                        ),
+                        line_start=statement.lineno,
+                        line_end=statement.end_lineno,
                     )
                 )
         blockers.extend(self._validate_symbol_references(cells, calls, inventory, findings))
@@ -744,6 +1142,7 @@ class MigrationEngine:
         step_list_names: set[str] = set()
         helper_names: set[str] = set()
         producer_counts: dict[tuple[str, str], int] = {}
+        producer_assignments: set[tuple[int, str]] = set()
         functions = inventory["functions"]
         assert isinstance(functions, dict)
         for name, (cell, function) in functions.items():
@@ -754,24 +1153,37 @@ class MigrationEngine:
             if path.endswith((".beta.assistants.create", ".beta.threads.create")):
                 if target:
                     setup_names.add(target)
+                    producer_assignments.add((id(statement), target))
                     producer_counts[("setup", target)] = (
                         producer_counts.get(("setup", target), 0) + 1
                     )
             elif path.endswith(".beta.threads.runs.create") and target:
                 run_names.add(target)
+                producer_assignments.add((id(statement), target))
                 producer_counts[("run", target)] = (
                     producer_counts.get(("run", target), 0) + 1
                 )
             elif path.endswith(".beta.threads.messages.list") and target:
                 message_list_names.add(target)
+                producer_assignments.add((id(statement), target))
                 producer_counts[("messages", target)] = (
                     producer_counts.get(("messages", target), 0) + 1
                 )
             elif path.endswith(".beta.threads.runs.steps.list") and target:
                 step_list_names.add(target)
+                producer_assignments.add((id(statement), target))
                 producer_counts[("steps", target)] = (
                     producer_counts.get(("steps", target), 0) + 1
                 )
+
+        for cell, statement, call, path in calls:
+            assignment = self._ancestor(cell, call, ast.Assign)
+            target_statement = (
+                assignment if isinstance(assignment, ast.Assign) else statement
+            )
+            target = _simple_target(target_statement)
+            if path.endswith(".beta.threads.runs.retrieve") and target in run_names:
+                producer_assignments.add((id(target_statement), target))
 
         for (category, name), count in producer_counts.items():
             if count <= 1:
@@ -791,6 +1203,54 @@ class MigrationEngine:
                     "Use a unique variable for each API object, then retry.",
                 )
             )
+
+        tracked_names = (
+            setup_names | run_names | message_list_names | step_list_names
+        )
+        reported_stores: set[tuple[int, int, str]] = set()
+        for cell in cells:
+            if not cell.tree:
+                continue
+            for node in ast.walk(cell.tree):
+                if not (
+                    isinstance(node, ast.Name)
+                    and isinstance(node.ctx, ast.Store)
+                    and node.id in tracked_names
+                ):
+                    continue
+                statement: ast.AST = node
+                while statement in cell.parents and not isinstance(
+                    statement, ast.stmt
+                ):
+                    statement = cell.parents[statement]
+                if (
+                    isinstance(statement, ast.stmt)
+                    and (id(statement), node.id) in producer_assignments
+                ):
+                    continue
+                key = (cell.index, node.lineno, node.id)
+                if key in reported_stores:
+                    continue
+                reported_stores.add(key)
+                blockers.append(
+                    f"reassignment-{cell.index}-{node.lineno}-{node.id}"
+                )
+                findings.append(
+                    Finding(
+                        "UNSUPPORTED-REASSIGNMENT-001",
+                        "API symbol is reassigned",
+                        cell.index,
+                        "manual",
+                        False,
+                        (
+                            f"Variable '{node.id}' is assigned outside its "
+                            "recognized API producer, so its identity is ambiguous."
+                        ),
+                        "Use a distinct variable for the reassigned value, then retry.",
+                        line_start=node.lineno,
+                        line_end=node.end_lineno,
+                    )
+                )
 
         reported: set[tuple[int, int, str]] = set()
         for cell in cells:
@@ -1033,7 +1493,10 @@ class MigrationEngine:
                     FlowCall(cell, statement, call, path.split(".beta.")[0])
                 )
 
-        if not self._flow_is_supported(messages, runs, assistant_setups, thread_setups):
+        pairing = self._pair_messages_with_runs(
+            messages, runs, assistant_setups, thread_setups
+        )
+        if pairing is None:
             findings.append(
                 Finding(
                     "UNSUPPORTED-FLOW-001",
@@ -1078,33 +1541,51 @@ class MigrationEngine:
             return 0
 
         changes = 0
-        for local, (cell, alias) in old_import_locals.items():
-            old = cell.text(alias)
+        for local, (import_cell, alias) in old_import_locals.items():
+            old = import_cell.text(alias)
             new = old.replace("FabricOpenAI", "FabricOpenAIResponses", 1)
-            self._patch(cell, alias, new)
+            self._patch(import_cell, alias, new)
             findings.append(
                 self._change(
                     "QUERY-IMPORT-001",
                     "Responses client import",
-                    cell,
+                    import_cell,
                     alias,
                     old,
                     new,
                 )
             )
             changes += 1
-            if not any(keyword.arg == "ai_skill_stage" for keyword in call.keywords):
+            missing_stage = next(
+                (
+                    (constructor_cell, constructor_call)
+                    for (
+                        constructor_cell,
+                        _,
+                        constructor_call,
+                        constructor_local,
+                    ) in constructor_calls
+                    if constructor_local == local
+                    and not any(
+                        keyword.arg == "ai_skill_stage"
+                        for keyword in constructor_call.keywords
+                    )
+                ),
+                None,
+            )
+            if missing_stage:
+                constructor_cell, constructor_call = missing_stage
                 findings.append(
                     Finding(
                         "QUERY-STAGE-001",
                         "Defaulted data agent stage",
-                        cell.index,
+                        constructor_cell.index,
                         "medium",
                         True,
                         'The migration selected "sandbox" because no stage was present.',
                         "Confirm sandbox (draft) versus production/published is intended.",
-                        line_start=call.lineno,
-                        line_end=call.end_lineno,
+                        line_start=constructor_call.lineno,
+                        line_end=constructor_call.end_lineno,
                         replacement_excerpt='ai_skill_stage="sandbox"',
                     )
                 )
@@ -1116,9 +1597,12 @@ class MigrationEngine:
             self._patch(cell, call, replacement)
             if "workspace_name" not in definitions and "workspace_id" not in definitions:
                 start, _ = cell.span(statement)
+                indent = self._statement_indent(cell, statement) or ""
                 placeholder = (
-                    '# TODO: Set this to the Fabric workspace name or ID.\n'
-                    'workspace_name = "<REQUIRED: Fabric workspace name or ID>"\n'
+                    "# TODO: Set this to the Fabric workspace name or ID.\n"
+                    f'{indent}workspace_name = '
+                    '"<REQUIRED: Fabric workspace name or ID>"\n'
+                    f"{indent}"
                 )
                 cell.patches.append(Patch(start, start, placeholder))
                 definitions.add("workspace_name")
@@ -1151,7 +1635,10 @@ class MigrationEngine:
         for setup in assistant_setups + thread_setups:
             old = setup.cell.text(setup.statement)
             label = "assistant" if setup in assistant_setups else "thread"
-            replacement = _comment_for(old, f"Responses API does not require a {label}.")
+            article = "an" if label.startswith("a") else "a"
+            replacement = _comment_for(
+                old, f"Responses API does not require {article} {label}."
+            )
             self._patch(setup.cell, setup.statement, replacement)
             findings.append(
                 self._change(
@@ -1167,19 +1654,9 @@ class MigrationEngine:
 
         self._remove_setup_diagnostics(cells, assistant_setups, thread_setups, findings)
 
-        used_messages: set[int] = set()
         previous_run_by_thread: dict[tuple[str, str | None], str] = {}
         for run in sorted(runs, key=lambda flow: flow.order):
-            candidates = [
-                (index, message)
-                for index, message in enumerate(messages)
-                if index not in used_messages
-                and message.order < run.order
-                and message.client == run.client
-                and message.thread_expr == run.thread_expr
-            ]
-            index, message = candidates[-1]
-            used_messages.add(index)
+            message = messages[pairing[id(run)]]
             key = (run.client, run.thread_expr)
             previous_run = previous_run_by_thread.get(key)
             input_text = message.content or '""'
@@ -1354,17 +1831,25 @@ class MigrationEngine:
                 changes += 1
         return changes
 
-    def _flow_is_supported(
+    def _pair_messages_with_runs(
         self,
         messages: list[FlowCall],
         runs: list[FlowCall],
         assistants: list[FlowCall],
         threads: list[FlowCall],
-    ) -> bool:
+    ) -> dict[int, int] | None:
+        """Map each run to the one message it answers.
+
+        Returns None when the flow is anything other than a sequence of
+        unambiguous message/run pairs, which is the only shape with a verified
+        one-to-one Responses translation. The same mapping drives the rewrite,
+        so validation and transformation cannot disagree about which question
+        belongs to which run.
+        """
         if not messages or len(messages) != len(runs):
-            return False
+            return None
         if any(not flow.target for flow in runs + assistants + threads):
-            return False
+            return None
         for message in messages:
             role = _keyword(message.call, "role")
             if (
@@ -1372,21 +1857,44 @@ class MigrationEngine:
                 or not isinstance(role, ast.Constant)
                 or role.value != "user"
             ):
-                return False
+                return None
             if any(
                 keyword.arg not in {"thread_id", "role", "content"}
                 for keyword in message.call.keywords
             ):
-                return False
+                return None
         for run in runs:
             if run.thread_expr is None or run.assistant_expr is None:
-                return False
+                return None
             if any(
                 keyword.arg not in {"thread_id", "assistant_id"}
                 for keyword in run.call.keywords
             ):
-                return False
-        return True
+                return None
+        pairing: dict[int, int] = {}
+        used_messages: set[int] = set()
+        previous_run_by_thread: dict[
+            tuple[str, str | None], tuple[int, int]
+        ] = {}
+        for run in sorted(runs, key=lambda flow: flow.order):
+            key = (run.client, run.thread_expr)
+            previous_order = previous_run_by_thread.get(key, (-1, -1))
+            candidates = [
+                index
+                for index, message in enumerate(messages)
+                if index not in used_messages
+                and previous_order < message.order < run.order
+                and message.client == run.client
+                and message.thread_expr == run.thread_expr
+            ]
+            if len(candidates) != 1:
+                return None
+            used_messages.add(candidates[0])
+            pairing[id(run)] = candidates[0]
+            previous_run_by_thread[key] = run.order
+        if len(used_messages) != len(messages):
+            return None
+        return pairing
 
     def _constructor_replacement(
         self,
@@ -1395,9 +1903,10 @@ class MigrationEngine:
         local: str,
         definitions: set[str],
     ) -> str:
-        old = cell.text(call)
-        renamed = re.sub(rf"\b{re.escape(local)}\b", local, old, count=1)
+        renamed = cell.text(call)
         if local == "FabricOpenAI":
+            # An aliased import keeps its local name; only the unaliased class
+            # name has to follow the renamed import.
             renamed = re.sub(
                 r"\bFabricOpenAI\b", "FabricOpenAIResponses", renamed, count=1
             )
@@ -1413,26 +1922,61 @@ class MigrationEngine:
             additions.append(f"workspace_name={value}")
         if "ai_skill_stage" not in present:
             additions.append('ai_skill_stage="sandbox"')
+        return self._with_extra_keywords(renamed, additions)
+
+    def _with_extra_keywords(self, text: str, additions: list[str]) -> str:
+        """Add keyword arguments to a call, keeping everything already there.
+
+        Only text after the last existing argument is rewritten, so existing
+        arguments, comments and line breaks inside the call survive verbatim.
+        """
         if not additions:
-            return renamed
-        close = renamed.rfind(")")
-        before = renamed[:close]
-        if "\n" in renamed:
-            closing_line = renamed[renamed.rfind("\n", 0, close) + 1 : close]
-            close_indent = closing_line[: len(closing_line) - len(closing_line.lstrip())]
-            inner_indent = close_indent + "    "
-            if before.rstrip().endswith("("):
-                separator = "\n"
-            elif before.rstrip().endswith(","):
-                separator = "\n"
-            else:
-                separator = ",\n"
-            insertion = separator + "".join(
-                f"{inner_indent}{argument},\n" for argument in additions
+            return text
+        close = text.rfind(")")
+        if close == -1:
+            return text
+        head, tail = text[:close], text[close:]
+        core = head.rstrip()
+        opens_empty = core.endswith("(")
+        if not opens_empty and not core.endswith(","):
+            core += ","
+
+        if "\n" not in text:
+            joined = ", ".join(additions)
+            return core + joined + tail if opens_empty else f"{core} {joined}{tail}"
+
+        newline = "\r\n" if "\r\n" in text else "\n"
+        lines = head.split("\n")
+        closing_line = lines[-1].rstrip("\r")
+        if closing_line.strip():
+            # The closing parenthesis trails the last argument. Keep it there
+            # and add the new arguments above it at the same indentation.
+            indent = closing_line[: len(closing_line) - len(closing_line.lstrip())]
+            addition_text = (f",{newline}").join(f"{indent}{item}" for item in additions)
+            return core + newline + addition_text + tail
+
+        close_indent = closing_line
+        if opens_empty:
+            indent = close_indent + "    "
+        else:
+            indent = next(
+                (
+                    line[: len(line) - len(line.lstrip())]
+                    for line in reversed(lines[:-1])
+                    if line.strip()
+                ),
+                close_indent + "    ",
             )
-            return before + insertion + close_indent + renamed[close:]
-        separator = "" if before.rstrip().endswith("(") else ", "
-        return before + separator + ", ".join(additions) + renamed[close:]
+        addition_text = "".join(f"{indent}{item},{newline}" for item in additions)
+        return core + newline + addition_text + close_indent + tail
+
+    def _statement_indent(
+        self, cell: ParsedCell, statement: ast.stmt
+    ) -> str | None:
+        """Indentation of a statement, or None when it does not open its line."""
+        start, _ = cell.span(statement)
+        prefix = cell.source[cell.line_offsets[statement.lineno - 1] : start]
+        return prefix if not prefix.strip() else None
 
     def _remove_setup_diagnostics(
         self,
@@ -1542,19 +2086,20 @@ class MigrationEngine:
     def _upgrade_install_cell(
         self, cells: list[ParsedCell], findings: list[Finding]
     ) -> int:
-        line_pattern = re.compile(r"(?m)^\s*%pip\s+install\b[^\n]*$")
-        package_pattern = re.compile(
-            r"(?<=\s)fabric-data-agent-sdk(?=\s|$)"
-        )
+        line_pattern = re.compile(r"(?m)^\s*[%!]pip\s+install\b[^\n]*$")
         for cell in cells:
             for match in line_pattern.finditer(cell.source):
                 old_line = match.group(0)
-                if not package_pattern.search(old_line):
+                package_match = SDK_REQUIREMENT_PATTERN.search(old_line)
+                if not package_match:
                     continue
-                replacement = package_pattern.sub(
-                    '"fabric-data-agent-sdk>=0.1.28a0"',
-                    old_line,
-                    count=1,
+                requirement = _sdk_requirement_replacement(package_match)
+                if requirement is None:
+                    continue
+                replacement = (
+                    old_line[: package_match.start()]
+                    + requirement
+                    + old_line[package_match.end() :]
                 )
                 cell.patches.append(Patch(match.start(), match.end(), replacement))
                 findings.append(
@@ -1575,100 +2120,104 @@ class MigrationEngine:
         return 0
 
     def _apply_evaluation_rule(
-        self, cells: list[ParsedCell], findings: list[Finding]
+        self,
+        cells: list[ParsedCell],
+        findings: list[Finding],
+        renamed_imports: list[tuple[int, int, int]] | None = None,
     ) -> int:
         changes = 0
+        module_aliases = self._evaluation_module_aliases(cells)
+        response_imports: list[tuple[int, int, int]] = list(renamed_imports or [])
+        evaluation_calls: list[tuple[ParsedCell, ast.Call]] = []
         for cell in cells:
             if not cell.tree:
                 continue
-            response_imported = "FabricOpenAIResponses" in cell.source
             for node in ast.walk(cell.tree):
-                if not isinstance(node, ast.Call):
-                    continue
-                if _dotted_name(node.func) != "evaluate_data_agent":
-                    continue
-                if any(keyword.arg == "client_class" for keyword in node.keywords):
-                    continue
-                old = cell.text(node)
-                close = old.rfind(")")
-                before = old[:close]
-                if "\n" in old:
-                    close_line_start = old.rfind("\n", 0, close) + 1
-                    before_args = old[:close_line_start]
-                    closing = old[close_line_start:close]
-                    closing_indent = closing[
-                        : len(closing) - len(closing.lstrip())
-                    ]
-                    indent = closing_indent + "    "
-                    separator = "" if before_args.rstrip().endswith(",") else ",\n"
-                    replacement = (
-                        before_args
-                        + separator
-                        + f"{indent}client_class=FabricOpenAIResponses,\n"
-                        + closing_indent
-                        + old[close:]
+                if (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module == "fabric.dataagent.client"
+                    and any(
+                        alias.name == "FabricOpenAIResponses"
+                        and alias.asname in {None, "FabricOpenAIResponses"}
+                        for alias in node.names
                     )
-                else:
-                    separator = "" if before.rstrip().endswith("(") else ", "
-                    replacement = (
-                        before
-                        + separator
-                        + "client_class=FabricOpenAIResponses"
-                        + old[close:]
+                ):
+                    response_imports.append(
+                        (cell.index, node.lineno, node.col_offset)
                     )
-                self._patch(cell, node, replacement)
-                if not response_imported:
-                    statement = next(
-                        (
-                            statement
-                            for statement in cell.tree.body
-                            if statement.lineno <= node.lineno <= statement.end_lineno
-                        ),
-                        cell.tree.body[0],
-                    )
-                    start, _ = cell.span(statement)
-                    cell.patches.append(
-                        Patch(
-                            start,
-                            start,
-                            "from fabric.dataagent.client import FabricOpenAIResponses\n",
-                        )
-                    )
-                    findings.append(
-                        Finding(
-                            "EVAL-IMPORT-001",
-                            "Responses evaluation client class import",
-                            cell.index,
-                            "high",
-                            True,
-                            (
-                                "Imported FabricOpenAIResponses so client_class "
-                                "resolves when the evaluation cell runs."
-                            ),
-                            (
-                                "Pass the class itself; do not construct a client "
-                                "instance for evaluate_data_agent."
-                            ),
-                            line_start=statement.lineno,
-                            replacement_excerpt=(
-                                "from fabric.dataagent.client import "
-                                "FabricOpenAIResponses"
-                            ),
-                        )
-                    )
-                    response_imported = True
-                findings.append(
-                    self._change(
-                        "EVAL-CLIENT-001",
-                        "Evaluation uses Responses client",
-                        cell,
-                        node,
-                        old,
-                        replacement,
-                        action="Compare evaluation result and step tables with the baseline.",
+                elif self._is_evaluation_call(node, module_aliases):
+                    evaluation_calls.append((cell, node))
+
+        for cell, node in sorted(
+            evaluation_calls,
+            key=lambda item: (
+                item[0].index,
+                item[1].lineno,
+                item[1].col_offset,
+            ),
+        ):
+            statement = next(
+                (
+                    statement
+                    for statement in cell.tree.body
+                    if statement.lineno <= node.lineno <= statement.end_lineno
+                ),
+                cell.tree.body[0],
+            )
+            call_position = (cell.index, node.lineno, node.col_offset)
+            if not any(position < call_position for position in response_imports):
+                start, _ = cell.span(statement)
+                cell.patches.append(
+                    Patch(
+                        start,
+                        start,
+                        "from fabric.dataagent.client import FabricOpenAIResponses\n",
                     )
                 )
+                findings.append(
+                    Finding(
+                        "EVAL-IMPORT-001",
+                        "Responses evaluation client class import",
+                        cell.index,
+                        "high",
+                        True,
+                        (
+                            "Imported FabricOpenAIResponses so client_class "
+                            "resolves when the evaluation cell runs."
+                        ),
+                        (
+                            "Pass the class itself; do not construct a client "
+                            "instance for evaluate_data_agent."
+                        ),
+                        line_start=statement.lineno,
+                        replacement_excerpt=(
+                            "from fabric.dataagent.client import "
+                            "FabricOpenAIResponses"
+                        ),
+                    )
+                )
+                response_imports.append((cell.index, statement.lineno, -1))
                 changes += 1
+
+            if any(keyword.arg == "client_class" for keyword in node.keywords):
+                continue
+            old = cell.text(node)
+            replacement = self._with_extra_keywords(
+                old, ["client_class=FabricOpenAIResponses"]
+            )
+            self._patch(cell, node, replacement)
+            findings.append(
+                self._change(
+                    "EVAL-CLIENT-001",
+                    "Evaluation uses Responses client",
+                    cell,
+                    node,
+                    old,
+                    replacement,
+                    action="Compare evaluation result and step tables with the baseline.",
+                )
+            )
+            changes += 1
         return changes
 
     def _commit_patches(
@@ -1809,7 +2358,7 @@ class MigrationEngine:
         relevant = [
             finding
             for finding in findings
-            if finding.rule_id.startswith(("QUERY-", "EVAL-", "UNSUPPORTED-", "OUTPUT-"))
+            if finding.rule_id.startswith(SCORED_RULE_PREFIXES)
             and finding.rule_id != "QUERY-DIAGNOSTIC-001"
         ]
         if not relevant:
@@ -1835,6 +2384,12 @@ class MigrationEngine:
             "Replace every <REQUIRED: ...> placeholder and confirm the workspace.",
             "Confirm sandbox (draft) versus production/published stage is intended.",
             "Run the migrated notebook in a non-production Fabric workspace.",
+            (
+                "Run evaluation inside a Fabric notebook. evaluate_data_agent and "
+                "the methods that display its results depend on the Fabric "
+                "runtime. To query a data agent from outside Fabric, use the data "
+                f"agent MCP server: {MCP_DOCS_URL}"
+            ),
             "Compare representative answers with the original notebook.",
             "Test a table-shaped answer and inspect response.output, not only output_text.",
             "Test failure, incomplete, cancellation, and timeout behavior.",

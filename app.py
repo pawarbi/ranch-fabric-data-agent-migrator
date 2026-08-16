@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import date
 from pathlib import Path
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -20,19 +20,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-components.html(
-    """
-<script>
-  (() => {
-    const param = new URLSearchParams(window.location.search).get("scoutTheme");
-    const theme =
-      param || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-    document.documentElement.setAttribute("data-theme", theme);
-  })();
-</script>
-""",
-    height=0,
-)
 
 st.markdown(
     """
@@ -63,32 +50,6 @@ st.markdown(
   --cp-sheen: rgba(255, 255, 255, 0.55);
   --cp-highlight: rgba(177, 31, 75, 0.12);
 }
-html[data-theme="dark"] {
-  color-scheme: dark;
-  --cp-bg: #3d3b3a;
-  --cp-bg-elevated: #343231;
-  --cp-surface: #292929;
-  --cp-surface-soft: #2e2e2e;
-  --cp-border: #474747;
-  --cp-border-strong: #5f5f5f;
-  --cp-text: #dedede;
-  --cp-text-muted: #919191;
-  --cp-text-soft: #b0b0b0;
-  --cp-accent: #fd8ea1;
-  --cp-accent-hover: #fb7b91;
-  --cp-accent-soft: rgba(253, 142, 161, 0.14);
-  --cp-accent-fg: #1a1a1a;
-  --cp-success: #4ade80;
-  --cp-danger: #f87171;
-  --cp-warning: #fbbf24;
-  --cp-link: #4da6ff;
-  --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.32);
-  --cp-overlay: rgba(41, 41, 41, 0.88);
-  --cp-panel: rgba(41, 41, 41, 0.72);
-  --cp-panel-strong: rgba(41, 41, 41, 0.96);
-  --cp-sheen: rgba(255, 255, 255, 0.04);
-  --cp-highlight: rgba(253, 142, 161, 0.12);
-}
 html, body, [class*="css"], .stApp {
   font-family: "Segoe UI", Aptos, Calibri, -apple-system, BlinkMacSystemFont, sans-serif;
 }
@@ -107,8 +68,64 @@ html, body, [class*="css"], .stApp {
   border-left: 6px solid var(--cp-accent);
   border-radius: 16px;
   box-shadow: 0 0 2px var(--cp-border), 0 1px 2px var(--cp-border);
-  padding: 28px 32px;
-  margin-bottom: 24px;
+  padding: 20px 24px;
+  margin: 0;
+}
+/* The uploader is the one action on this screen, so it sits beside the hero
+   rather than below the explanatory cards. */
+.upload-title {
+  color: var(--cp-text);
+  font-size: 1.06rem;
+  font-weight: 750;
+  margin: 6px 0 2px;
+}
+.upload-sub {
+  color: var(--cp-text-muted);
+  font-size: 0.88rem;
+  line-height: 1.5;
+  margin-bottom: 4px;
+}
+[data-testid="stFileUploaderDropzone"] {
+  background: var(--cp-accent-soft);
+  border: 1.5px dashed var(--cp-accent);
+  border-radius: 12px;
+}
+.retirement-flag {
+  align-items: center;
+  background: var(--cp-accent);
+  border-radius: 999px;
+  color: var(--cp-accent-fg);
+  display: inline-flex;
+  flex-wrap: wrap;
+  font-size: 0.78rem;
+  font-weight: 700;
+  gap: 8px;
+  letter-spacing: 0.02em;
+  margin-bottom: 14px;
+  padding: 6px 8px 6px 14px;
+}
+.retirement-flag.past {
+  background: var(--cp-surface-soft);
+  border: 1px solid var(--cp-border-strong);
+  color: var(--cp-text);
+}
+.flag-count {
+  background: var(--cp-accent-fg);
+  border-radius: 999px;
+  color: var(--cp-accent);
+  padding: 2px 9px;
+}
+.retirement-flag.past .flag-count {
+  background: var(--cp-accent);
+  color: var(--cp-accent-fg);
+}
+.section-label {
+  color: var(--cp-text-muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  margin: 4px 0 10px;
+  text-transform: uppercase;
 }
 .brand-row {
   align-items: center;
@@ -119,7 +136,7 @@ html, body, [class*="css"], .stApp {
 }
 .wordmark {
   color: var(--cp-text);
-  font-size: clamp(2.8rem, 6vw, 4.6rem);
+  font-size: clamp(2.1rem, 4.4vw, 3.2rem);
   font-weight: 800;
   letter-spacing: -0.07em;
   line-height: 0.95;
@@ -144,11 +161,11 @@ html, body, [class*="css"], .stApp {
 }
 .hero h1, .hero h2 {
   color: var(--cp-text);
-  font-size: clamp(1.1rem, 2vw, 1.45rem);
+  font-size: clamp(1.02rem, 1.7vw, 1.24rem);
   font-weight: 600;
   letter-spacing: -0.015em;
   line-height: 1.3;
-  margin: 0 0 14px;
+  margin: 0 0 10px;
 }
 .ranch-initial {
   color: var(--cp-accent);
@@ -157,14 +174,14 @@ html, body, [class*="css"], .stApp {
 }
 .hero p {
   color: var(--cp-text-muted);
-  font-size: 1.05rem;
-  line-height: 1.6;
+  font-size: 0.96rem;
+  line-height: 1.55;
   margin: 0;
   max-width: 760px;
 }
 .hero .tagline {
   color: var(--cp-text);
-  font-size: 1.08rem;
+  font-size: 1rem;
   font-weight: 600;
   margin-bottom: 6px;
 }
@@ -172,7 +189,7 @@ html, body, [class*="css"], .stApp {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  margin-top: 20px;
+  margin: 12px 0 0;
 }
 .source-row {
   align-items: center;
@@ -180,7 +197,7 @@ html, body, [class*="css"], .stApp {
   display: flex;
   flex-wrap: wrap;
   gap: 8px 16px;
-  margin-top: 20px;
+  margin-top: 8px;
   padding-top: 16px;
 }
 .source-label {
@@ -200,6 +217,7 @@ html, body, [class*="css"], .stApp {
   text-decoration: underline;
 }
 .beta-warning {
+  height: 100%;
   background: var(--cp-accent-soft);
   border: 1px solid var(--cp-accent);
   border-radius: 16px;
@@ -207,7 +225,7 @@ html, body, [class*="css"], .stApp {
   display: grid;
   gap: 4px;
   grid-template-columns: auto 1fr;
-  margin: 0 0 24px;
+  margin: 20px 0 0;
   padding: 16px 18px;
 }
 .warning-mark {
@@ -224,6 +242,32 @@ html, body, [class*="css"], .stApp {
   color: var(--cp-text-muted);
   font-size: 0.9rem;
   line-height: 1.5;
+}
+.runtime-note {
+  height: 100%;
+  background: var(--cp-surface);
+  border: 1px solid var(--cp-border);
+  border-radius: 16px;
+  color: var(--cp-text);
+  margin: 20px 0 0;
+  padding: 16px 18px;
+}
+.runtime-note-title {
+  font-weight: 750;
+  margin-bottom: 4px;
+}
+.runtime-note-copy {
+  color: var(--cp-text-muted);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+.runtime-note-copy code {
+  background: var(--cp-surface-soft);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+.runtime-note-copy a {
+  color: var(--cp-link);
 }
 .trust-pill {
   background: var(--cp-surface);
@@ -443,7 +487,7 @@ def render_finding(finding: dict[str, object]) -> None:
     if finding.get("action"):
         st.caption(f"Action: {finding['action']}")
     if finding.get("original_excerpt") or finding.get("replacement_excerpt"):
-        with st.expander("Show redacted change"):
+        with st.expander("Changes", expanded=True):
             if finding.get("original_excerpt"):
                 st.caption("Before")
                 st.code(str(finding["original_excerpt"]), language="python")
@@ -452,9 +496,76 @@ def render_finding(finding: dict[str, object]) -> None:
                 st.code(str(finding["replacement_excerpt"]), language="python")
 
 
-st.markdown(
-    """
+MCP_DOCS_URL = "https://learn.microsoft.com/fabric/data-science/data-agent-mcp-server"
+
+RUNTIME_SCOPE_NOTE = f"""
+<section class="runtime-note">
+  <div class="runtime-note-title">Where the migrated code can run</div>
+  <div class="runtime-note-copy">
+    Evaluation depends on the Fabric notebook runtime. <code>evaluate_data_agent</code>
+    and the methods that display evaluation results only work inside a Fabric
+    notebook, not from a local IDE, a script, or an external service.
+    To query a data agent from outside Fabric, use the data agent MCP server
+    instead of this SDK. See
+    <a href="{MCP_DOCS_URL}" target="_blank" rel="noopener noreferrer">Data agent
+    as Model Context Protocol server</a>.
+  </div>
+</section>
+"""
+
+BETA_WARNING = """
+<section class="beta-warning">
+  <div class="warning-mark">!</div>
+  <div>
+    <div class="warning-title">BETA means bring a backup.</div>
+    <div class="warning-copy">Keep the current notebook. Test the migrated copy in
+    a non-production Fabric workspace and compare representative results before
+    deleting, overwriting, or redirecting anything. Migration confidence is not
+    runtime proof.</div>
+  </div>
+</section>
+"""
+
+SOURCE_ROW = """
+<section class="source-row">
+  <span class="source-label">Why now</span>
+  <a href="https://community.fabric.microsoft.com/t5/Fabric-Updates-Blog/Prepare-your-Fabric-Data-Agent-integrations-for-Assistants-API/ba-p/5314634" target="_blank" rel="noopener noreferrer">Microsoft retirement announcement</a>
+  <a href="https://learn.microsoft.com/fabric/data-science/fabric-data-agent-sdk" target="_blank" rel="noopener noreferrer">Migration guidance</a>
+  <a href="https://github.com/microsoft/fabric-samples/tree/main/docs-samples/data-science/data-agent-sdk/responses-api" target="_blank" rel="noopener noreferrer">Official samples</a>
+</section>
+"""
+
+# Confirmed against Microsoft's retirement announcement, linked under "Why now".
+RETIREMENT_DATE = date(2026, 8, 26)
+
+
+def retirement_flag() -> str:
+    remaining = (RETIREMENT_DATE - date.today()).days
+    stamp = f"{RETIREMENT_DATE.day} {RETIREMENT_DATE:%B %Y}"
+    if remaining > 1:
+        tone, countdown = "", f"{remaining} days left"
+    elif remaining == 1:
+        tone, countdown = "", "1 day left"
+    elif remaining == 0:
+        tone, countdown = "", "today"
+    else:
+        tone, countdown = "past", f"{abs(remaining)} days ago"
+    verb = "retires" if remaining >= 0 else "retired"
+    return (
+        f'<div class="retirement-flag {tone}">'
+        f"Assistants API {verb} {stamp}. Migrate now."
+        f'<span class="flag-count">{countdown}</span>'
+        "</div>"
+    )
+
+
+intro_col, upload_col = st.columns([1.15, 1], gap="large")
+
+with intro_col:
+    st.markdown(
+        f"""
 <section class="hero">
+  {retirement_flag()}
   <div class="eyebrow">Fabric Data Agent · Assistants → Responses</div>
   <div class="brand-row">
     <div class="wordmark">RANCH</div>
@@ -466,56 +577,44 @@ st.markdown(
   <span class="ranch-initial">C</span>onversion
   <span class="ranch-initial">H</span>elper</h1>
   <p class="tagline">Putting old threads out to pasture—without trampling the rest of your notebook.</p>
-  <p>Upload a notebook. RANCH changes only verified Assistants API patterns, shows
-  its work, and hands back a migrated copy plus a review report.</p>
+  <p>Only verified Assistants API patterns change. You get a migrated copy plus a
+  review report.</p>
   <div class="trust-row">
-    <span class="trust-pill">No code runs here</span>
-    <span class="trust-pill">No mystery rewrites</span>
-    <span class="trust-pill">Original stays put</span>
-    <span class="trust-pill">Ambiguous code gets a flag, not a guess</span>
-  </div>
-  <div class="source-row">
-    <span class="source-label">Why now</span>
-    <a href="https://community.fabric.microsoft.com/t5/Fabric-Updates-Blog/Prepare-your-Fabric-Data-Agent-integrations-for-Assistants-API/ba-p/5314634" target="_blank" rel="noopener noreferrer">Microsoft retirement announcement</a>
-    <a href="https://learn.microsoft.com/fabric/data-science/fabric-data-agent-sdk" target="_blank" rel="noopener noreferrer">Migration guidance</a>
-    <a href="https://github.com/microsoft/fabric-samples/tree/main/docs-samples/data-science/data-agent-sdk/responses-api" target="_blank" rel="noopener noreferrer">Official samples</a>
+    <span class="trust-pill">No LLM used</span>
   </div>
 </section>
 """,
-    unsafe_allow_html=True,
-)
+        unsafe_allow_html=True,
+    )
 
-st.markdown(
-    """
-<section class="beta-warning">
-  <div class="warning-mark">!</div>
-  <div>
-    <div class="warning-title">BETA means bring a backup.</div>
-    <div class="warning-copy">Keep the current notebook. Test the migrated copy in
-    a non-production Fabric workspace and compare representative results before
-    deleting, overwriting, or redirecting anything. Migration confidence is not
-    runtime proof.</div>
-  </div>
-</section>
-""",
-    unsafe_allow_html=True,
-)
-
-uploaded = st.file_uploader(
-    "Choose one Jupyter notebook",
-    type=["ipynb"],
-    accept_multiple_files=False,
-    help="Maximum 10 MB and 1,000 cells. The notebook is processed in memory.",
-)
-st.markdown(
-    '<div class="privacy">The app parses notebook JSON but never executes a cell. '
-    "Migration confidence measures rule coverage and review risk—not whether the "
-    "notebook will run successfully against your Fabric environment.</div>",
-    unsafe_allow_html=True,
-)
+with upload_col:
+    st.markdown(
+        '<div class="upload-title">Start here</div>'
+        '<div class="upload-sub">Drop in one .ipynb file. Nothing is executed '
+        "and nothing is sent to a model.</div>",
+        unsafe_allow_html=True,
+    )
+    uploaded = st.file_uploader(
+        "Choose one Jupyter notebook",
+        type=["ipynb"],
+        accept_multiple_files=False,
+        label_visibility="collapsed",
+        help="Maximum 10 MB and 1,000 cells. The notebook is processed in memory.",
+    )
+    st.markdown(
+        '<div class="privacy">Deterministic rules only. No LLM, no external '
+        "service, no notebook content leaves this machine. Migration confidence "
+        "measures rule coverage and review risk, not whether the notebook will "
+        "run against your Fabric environment.</div>",
+        unsafe_allow_html=True,
+    )
+    # Sits under the uploader so this column matches the hero's height instead
+    # of leaving a gap beside it.
+    st.markdown(BETA_WARNING, unsafe_allow_html=True)
 
 if uploaded is None:
-    st.info("Upload an .ipynb notebook to begin the assessment.")
+    st.markdown(RUNTIME_SCOPE_NOTE, unsafe_allow_html=True)
+    st.markdown(SOURCE_ROW, unsafe_allow_html=True)
     st.stop()
 
 try:
@@ -569,14 +668,37 @@ with metrics_col:
         "structural preservation. It does not prove service behavior."
     )
 
+if summary["cells_changed"] == 0:
+    # Nothing was rewritten. A success card here would misread as "migrated".
+    if report["status"] == "no_migration_needed":
+        ready_icon = "="
+        ready_title = "Nothing to migrate. Your notebook is unchanged."
+        ready_detail = (
+            "No Assistants API query pattern was found, so the download is "
+            "identical to the file you uploaded."
+        )
+    else:
+        ready_icon = "!"
+        ready_title = "Nothing was migrated. Your notebook is unchanged."
+        ready_detail = (
+            f'{summary["manual_actions"]} finding(s) have to be resolved by hand. '
+            "The download is identical to the file you uploaded. See Review & test."
+        )
+else:
+    ready_icon = "✓"
+    ready_title = "Your migrated notebook is ready for review."
+    ready_detail = (
+        f'{summary["cells_changed"]} cells updated · Keep the original, then '
+        "test this copy in a non-production workspace."
+    )
+
 st.markdown(
     f"""
 <section class="ready-card" aria-live="polite">
-  <div class="ready-icon">✓</div>
+  <div class="ready-icon">{ready_icon}</div>
   <div class="ready-copy">
-    <div class="ready-title">Your migrated notebook is ready for review.</div>
-    <div class="ready-detail">{summary["cells_changed"]} cells updated · Keep the
-    original, then test this copy in a non-production workspace.</div>
+    <div class="ready-title">{ready_title}</div>
+    <div class="ready-detail">{ready_detail}</div>
   </div>
 </section>
 """,
@@ -647,6 +769,7 @@ with review_tab:
     st.subheader("What you should test and confirm")
     for index, item in enumerate(report["user_test_checklist"], start=1):
         st.checkbox(item, key=f"check-{index}")
+    st.markdown(RUNTIME_SCOPE_NOTE, unsafe_allow_html=True)
 
 with mapping_tab:
     mapping = report["sdk_mapping"]
@@ -660,3 +783,6 @@ with mapping_tab:
     st.subheader("Evidence")
     for source in mapping["sources"]:
         st.markdown(f"- [{source}]({source})")
+
+st.markdown(SOURCE_ROW, unsafe_allow_html=True)
+
